@@ -76,7 +76,7 @@ class DbtColumnLineageExtractor:
             missing = len(missing_compiled)
             msg = f"{missing}/{total} models are missing compiled SQL. Ensure dbt compile was run."
             
-            self.logger.error(msg)
+            self.logger.warning(msg)
 
         # --- Non-materialized models (missing from catalog) ---
         catalog_models = set(self.catalog.get("nodes", {}).keys())
@@ -84,7 +84,7 @@ class DbtColumnLineageExtractor:
 
         if non_materialized:
             msg = f"{len(non_materialized)}/{len(all_models)} models are not materialized (missing from catalog)."
-            self.logger.error(msg)
+            self.logger.warning(msg)
 
     def _get_colibri_version(self):
         try:
