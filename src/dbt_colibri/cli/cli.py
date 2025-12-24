@@ -79,7 +79,7 @@ def generate_report(output_dir, manifest, catalog, debug, light):
             logger.error(f"❌ Catalog file not found at {catalog}")
             sys.exit(1)
 
-        logger.info("Loading dbt manifest and catalog...")
+        logger.info("📖 Loading dbt manifest and catalog files...")
         extractor = DbtColumnLineageExtractor(manifest, catalog)
 
         # --- Log version info (matches what will end up in metadata) ---
@@ -87,22 +87,31 @@ def generate_report(output_dir, manifest, catalog, debug, light):
         adapter = manifest_meta.get("adapter_type", "unknown")
         dbt_version = manifest_meta.get("dbt_version", "unknown")
         project = manifest_meta.get("project_name", "unknown")
+        
+        model_count = len([n for n in extractor.manifest.get("nodes", {}).values() 
+                          if n.get("resource_type") == "model"])
+        source_count = len([n for n in extractor.manifest.get("sources", {}).values()])
 
         logger.info(
-            "Running with configuration:\n"
-            f"         dbt-colbri version : {extractor.colibri_version}\n"
+            "ℹ️  Configuration:\n"
+            f"         dbt-colibri version : {extractor.colibri_version}\n"
             f"         dbt version        : {dbt_version}\n"
             f"         SQL dialect        : {adapter}\n"
-            f"         dbt project        : {project}"
+            f"         dbt project        : {project}\n"
+            f"         models             : {model_count}\n"
+            f"         sources            : {source_count}"
         )
 
-        logger.info("Extracting lineage data...")
+        logger.info("🔍 Analyzing SQL to extract column-level lineage...")
+        logger.info(f"   Processing {len(extractor.selected_models)} models...")
         report_generator = DbtColibriReportGenerator(extractor, light_mode=light)
 
-        logger.info("Generating report...")
+        logger.info("📝 Building lineage report structure...")
         report_generator.generate_report(output_dir=output_dir)
+        
+        logger.info("💾 Writing output files...")
         click.echo("\n")
-        click.echo("✅ Report completed!")
+        click.echo("✅ Column lineage analysis complete!")
         click.echo(f"  📁 JSON: {output_dir}/colibri-manifest.json")
         click.echo(f"  🌐 HTML: {output_dir}/index.html")
         sys.exit(0)
