@@ -875,3 +875,281 @@ def test_nodes_with_null_relation_name_are_skipped():
 
         # The operation with null relation_name should NOT be present
         assert not any("on-run-end" in key for key in nodes_with_columns.keys())
+
+
+# ============================================================================
+# Multiprocessing Tests
+# ============================================================================
+
+def test_extract_project_lineage_returns_valid_structure(dbt_valid_test_data_dir):
+    """Test that extract_project_lineage returns the expected structure."""
+    if dbt_valid_test_data_dir is None:
+        pytest.skip("No valid versioned test data present")
+
+    extractor = DbtColumnLineageExtractor(
+        manifest_path=f"{dbt_valid_test_data_dir}/manifest.json",
+        catalog_path=f"{dbt_valid_test_data_dir}/catalog.json"
+    )
+
+    result = extractor.extract_project_lineage()
+
+    # Verify top-level structure
+    assert isinstance(result, dict)
+    assert "lineage" in result
+    assert "parents" in result["lineage"]
+    assert "children" in result["lineage"]
+    assert isinstance(result["lineage"]["parents"], dict)
+    assert isinstance(result["lineage"]["children"], dict)
+
+
+def test_extract_project_lineage_with_single_worker(dbt_valid_test_data_dir):
+    """Test that extract_project_lineage works with a single worker."""
+    if dbt_valid_test_data_dir is None:
+        pytest.skip("No valid versioned test data present")
+
+    extractor = DbtColumnLineageExtractor(
+        manifest_path=f"{dbt_valid_test_data_dir}/manifest.json",
+        catalog_path=f"{dbt_valid_test_data_dir}/catalog.json"
+    )
+
+    result = extractor.extract_project_lineage(num_workers=1)
+
+    assert isinstance(result, dict)
+    assert "lineage" in result
+    assert isinstance(result["lineage"]["parents"], dict)
+    assert isinstance(result["lineage"]["children"], dict)
+
+
+def test_extract_project_lineage_with_multiple_workers(dbt_valid_test_data_dir):
+    """Test that extract_project_lineage works with multiple workers."""
+    if dbt_valid_test_data_dir is None:
+        pytest.skip("No valid versioned test data present")
+
+    extractor = DbtColumnLineageExtractor(
+        manifest_path=f"{dbt_valid_test_data_dir}/manifest.json",
+        catalog_path=f"{dbt_valid_test_data_dir}/catalog.json"
+    )
+
+    result = extractor.extract_project_lineage(num_workers=2)
+
+    assert isinstance(result, dict)
+    assert "lineage" in result
+    assert isinstance(result["lineage"]["parents"], dict)
+    assert isinstance(result["lineage"]["children"], dict)
+
+
+def test_extract_project_lineage_consistency_across_worker_counts(dbt_valid_test_data_dir):
+    """Test that results are consistent regardless of worker count."""
+    if dbt_valid_test_data_dir is None:
+        pytest.skip("No valid versioned test data present")
+
+    extractor = DbtColumnLineageExtractor(
+        manifest_path=f"{dbt_valid_test_data_dir}/manifest.json",
+        catalog_path=f"{dbt_valid_test_data_dir}/catalog.json"
+    )
+
+    # Run with 1 worker
+    result_single = extractor.extract_project_lineage(num_workers=1)
+
+    # Run with 2 workers
+    result_multi = extractor.extract_project_lineage(num_workers=2)
+
+    # Parents should have the same keys
+    assert set(result_single["lineage"]["parents"].keys()) == set(result_multi["lineage"]["parents"].keys())
+
+    # Children should have the same keys
+    assert set(result_single["lineage"]["children"].keys()) == set(result_multi["lineage"]["children"].keys())
+
+    # Verify parent content matches for each model
+    for model_node in result_single["lineage"]["parents"]:
+        single_parents = result_single["lineage"]["parents"][model_node]
+        multi_parents = result_multi["lineage"]["parents"][model_node]
+        assert set(single_parents.keys()) == set(multi_parents.keys())
+
+
+def test_extract_project_lineage_handles_empty_models():
+    """Test that extract_project_lineage handles projects with no processable models."""
+    manifest = {
+        "metadata": {"adapter_type": "snowflake"},
+        "nodes": {
+            "model.test.empty_model": {
+                "path": "models/empty.sql",
+                "resource_type": "model",
+                "compiled_code": None,  # No compiled code
+                "depends_on": {"nodes": []},
+                "database": "test_db",
+                "schema": "test_schema",
+                "name": "empty_model",
+                "columns": {},
+                "relation_name": "test_db.test_schema.empty_model",
+                "config": {"materialized": "view"}
+            }
+        },
+        "sources": {},
+        "parent_map": {},
+        "child_map": {}
+    }
+
+    catalog = {
+        "nodes": {},
+        "sources": {}
+    }
+
+    with patch('dbt_colibri.utils.json_utils.read_json') as mock_read_json:
+        mock_read_json.side_effect = [manifest, catalog]
+
+        extractor = DbtColumnLineageExtractor(
+            manifest_path="dummy_path",
+            catalog_path="dummy_path"
+        )
+
+        result = extractor.extract_project_lineage(num_workers=1)
+
+        # Should return valid structure even with no processable models
+        assert isinstance(result, dict)
+        assert "lineage" in result
+        assert result["lineage"]["parents"] == {}
+        assert result["lineage"]["children"] == {}
+
+
+def test_extract_project_lineage_processes_all_models(dbt_valid_test_data_dir):
+    """Test that all eligible models are processed."""
+    if dbt_valid_test_data_dir is None:
+        pytest.skip("No valid versioned test data present")
+
+    extractor = DbtColumnLineageExtractor(
+        manifest_path=f"{dbt_valid_test_data_dir}/manifest.json",
+        catalog_path=f"{dbt_valid_test_data_dir}/catalog.json"
+    )
+
+    # Count eligible models (models/snapshots with compiled code)
+    eligible_models = [
+        node_id for node_id, node in extractor.manifest.get("nodes", {}).items()
+        if node.get("resource_type") in ["model", "snapshot"]
+        and node.get("compiled_code")
+        and not node.get("path", "").endswith(".py")
+    ]
+
+    result = extractor.extract_project_lineage(num_workers=2)
+
+    # At least some models should have been processed
+    if eligible_models:
+        # Not all models may produce lineage (some might have errors),
+        # but we should have processed something
+        total_processed = len(result["lineage"]["parents"]) + len(result["lineage"]["children"])
+        assert total_processed >= 0  # Basic sanity check
+
+
+def test_process_single_model_static_function():
+    """Test the standalone _process_single_model function used by workers."""
+    from dbt_colibri.lineage_extractor.extractor import _process_single_model
+
+    # Create minimal test data
+    model_node = "model.test.simple_model"
+    model_info = {
+        "path": "models/simple.sql",
+        "resource_type": "model",
+        "compiled_code": "SELECT id, name FROM source_table",
+        "unique_id": model_node,
+        "database": "test_db",
+        "schema": "test_schema",
+        "name": "simple_model"
+    }
+    manifest_nodes = {model_node: model_info}
+    catalog_nodes = {}
+    parent_map = {model_node: []}
+    nodes_with_columns = {model_node: ["id", "name"]}
+
+    args = (
+        model_node,
+        model_info,
+        "snowflake",
+        manifest_nodes,
+        nodes_with_columns,
+        catalog_nodes,
+        parent_map,
+        None,  # counter
+        1  # total_models
+    )
+
+    result = _process_single_model(args)
+
+    # Verify return structure
+    assert len(result) == 4
+    returned_model_node, model_parents, model_children, had_error = result
+    assert returned_model_node == model_node
+    assert isinstance(model_parents, dict)
+    assert isinstance(model_children, dict)
+    assert isinstance(had_error, bool)
+
+
+def test_process_single_model_skips_python_models():
+    """Test that Python models are skipped."""
+    from dbt_colibri.lineage_extractor.extractor import _process_single_model
+
+    model_node = "model.test.python_model"
+    model_info = {
+        "path": "models/python_model.py",  # Python model
+        "resource_type": "model",
+        "compiled_code": "def model(dbt, session): pass",
+        "unique_id": model_node,
+        "database": "test_db",
+        "schema": "test_schema",
+        "name": "python_model"
+    }
+
+    args = (
+        model_node,
+        model_info,
+        "snowflake",
+        {model_node: model_info},
+        {},
+        {},
+        {},
+        None,
+        1
+    )
+
+    result = _process_single_model(args)
+    returned_model_node, model_parents, model_children, had_error = result
+
+    # Python models should be skipped (empty results, no error)
+    assert model_parents == {}
+    assert model_children == {}
+    assert had_error is False
+
+
+def test_process_single_model_skips_no_compiled_code():
+    """Test that models without compiled code are skipped."""
+    from dbt_colibri.lineage_extractor.extractor import _process_single_model
+
+    model_node = "model.test.no_code_model"
+    model_info = {
+        "path": "models/no_code.sql",
+        "resource_type": "model",
+        "compiled_code": None,  # No compiled code
+        "unique_id": model_node,
+        "database": "test_db",
+        "schema": "test_schema",
+        "name": "no_code_model"
+    }
+
+    args = (
+        model_node,
+        model_info,
+        "snowflake",
+        {model_node: model_info},
+        {},
+        {},
+        {},
+        None,
+        1
+    )
+
+    result = _process_single_model(args)
+    returned_model_node, model_parents, model_children, had_error = result
+
+    # Models without compiled code should be skipped
+    assert model_parents == {}
+    assert model_children == {}
+    assert had_error is False

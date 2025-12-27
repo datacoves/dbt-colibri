@@ -1,11 +1,12 @@
 
 from sqlglot.lineage import maybe_parse, SqlglotError, exp
 import logging
+import sys
+from multiprocessing import Pool, cpu_count
 from ..utils import json_utils, parsing_utils
 from .lineage import lineage, prepare_scope
 import re
 from importlib.metadata import version, PackageNotFoundError
-import gc
 
 
 def get_select_expressions(expr: exp.Expression) -> list[exp.Expression]:
@@ -23,6 +24,240 @@ def get_select_expressions(expr: exp.Expression) -> list[exp.Expression]:
 
 def extract_column_refs(expr: exp.Expression) -> list[exp.Column]:
     return list(expr.find_all(exp.Column))
+
+
+def _process_single_model(args):
+    """
+    Process a single model for lineage extraction.
+    This is a standalone function for multiprocessing.
+
+    Returns:
+        tuple: (model_node, model_parents, model_children, error_occurred)
+    """
+    (model_node, model_info, dialect, manifest_nodes, nodes_with_columns,
+     catalog_nodes, parent_map, counter, total_models) = args
+
+    logger = logging.getLogger("colibri")
+    model_parents = {}
+    model_children = {}
+    error_occurred = False
+
+    try:
+        if model_info.get("path", "").endswith(".py"):
+            return (model_node, {}, {}, False)
+        if model_info.get("resource_type") not in ["model", "snapshot"]:
+            return (model_node, {}, {}, False)
+        if not model_info.get("compiled_code"):
+            return (model_node, {}, {}, False)
+
+        # Build parent catalog for this model
+        parent_catalog = _get_parent_nodes_catalog_static(
+            model_info, manifest_nodes, catalog_nodes, parent_map, nodes_with_columns
+        )
+        schema = _generate_schema_dict_from_catalog_static(parent_catalog)
+        model_sql = model_info["compiled_code"]
+
+        # Parse and qualify once per model
+        parsed_model_sql = maybe_parse(model_sql, dialect=dialect)
+        if dialect == "postgres":
+            parsed_model_sql = parsing_utils.remove_quotes(parsed_model_sql)
+        if dialect == "bigquery":
+            parsed_model_sql = parsing_utils.remove_upper(parsed_model_sql)
+        qualified_expr, scope = prepare_scope(parsed_model_sql, schema=schema, dialect=dialect)
+
+        def normalize_column_name(name: str) -> str:
+            name = name.strip('"').strip("'")
+            name = re.sub(r"::\s*\w+$", "", name)
+            if name.startswith("$"):
+                name = name[1:]
+            return name
+
+        # Get columns for this model
+        columns = _get_list_of_columns_for_node_static(model_node, nodes_with_columns)
+
+        for column_name in columns:
+            column_key = column_name.lower()
+            # Snapshot special columns
+            if model_info.get("resource_type") == "snapshot" and column_name in [
+                "dbt_valid_from", "dbt_valid_to", "dbt_updated_at", "dbt_scd_id",
+            ]:
+                model_parents[column_key] = []
+                continue
+
+            model_parents[column_key] = []
+
+            try:
+                normalized_column = normalize_column_name(column_name)
+                lineage_node = lineage(
+                    normalized_column,
+                    qualified_expr,
+                    schema=schema,
+                    dialect=dialect,
+                    scope=scope,
+                )
+
+                for n in lineage_node.walk():
+                    if n.source.key == "table":
+                        parent_columns = _get_dbt_node_from_sqlglot_table_node_static(
+                            n, model_node, manifest_nodes, nodes_with_columns
+                        )
+                        if parent_columns:
+                            parent_model = parent_columns["dbt_node"]
+                            parent_col = parent_columns["column"].lower()
+                            if parent_model == model_node:
+                                continue
+                            if parent_columns not in model_parents[column_key]:
+                                parent_columns["lineage_type"] = lineage_node.lineage_type
+                                model_parents[column_key].append(parent_columns)
+                            # Track children
+                            if parent_model not in model_children:
+                                model_children[parent_model] = {}
+                            if parent_col not in model_children[parent_model]:
+                                model_children[parent_model][parent_col] = []
+                            model_children[parent_model][parent_col].append(
+                                {"column": column_key, "dbt_node": model_node}
+                            )
+
+            except SqlglotError:
+                # Fallback: try to parse as expression and extract columns
+                try:
+                    alias_expr_map = {}
+                    select_exprs = get_select_expressions(parsed_model_sql)
+                    for expr in select_exprs:
+                        alias = expr.alias_or_name
+                        if alias:
+                            alias_expr_map[alias.lower()] = expr
+                    expr = alias_expr_map.get(normalize_column_name(column_name).lower())
+                    if expr:
+                        upstream_columns = extract_column_refs(expr)
+                        for col in upstream_columns:
+                            try:
+                                sub_node = lineage(
+                                    col.name,
+                                    qualified_expr,
+                                    schema=schema,
+                                    dialect=dialect,
+                                    scope=scope,
+                                )
+                                for n in sub_node.walk():
+                                    if n.source.key == "table":
+                                        parent_columns = _get_dbt_node_from_sqlglot_table_node_static(
+                                            n, model_node, manifest_nodes, nodes_with_columns
+                                        )
+                                        if parent_columns:
+                                            parent_model = parent_columns["dbt_node"]
+                                            parent_col = parent_columns["column"].lower()
+                                            if parent_model == model_node:
+                                                continue
+                                            if parent_columns not in model_parents[column_key]:
+                                                parent_columns["lineage_type"] = sub_node.lineage_type
+                                                model_parents[column_key].append(parent_columns)
+                                            if parent_model not in model_children:
+                                                model_children[parent_model] = {}
+                                            if parent_col not in model_children[parent_model]:
+                                                model_children[parent_model][parent_col] = []
+                                            model_children[parent_model][parent_col].append(
+                                                {"column": column_key, "dbt_node": model_node}
+                                            )
+                            except SqlglotError:
+                                pass
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Update shared counter for progress
+        if counter is not None:
+            with counter.get_lock():
+                counter.value += 1
+                if sys.stdout.isatty():
+                    sys.stdout.write(f"\r[INFO] Processing models: {counter.value} of {total_models}")
+                    sys.stdout.flush()
+
+        return (model_node, model_parents, model_children, False)
+
+    except Exception as e:
+        logger.error(f"Error processing model {model_node}: {str(e)}")
+        return (model_node, {}, {}, True)
+
+
+def _get_parent_nodes_catalog_static(model_info, manifest_nodes, catalog_nodes, parent_map, nodes_with_columns):
+    """Static version of _get_parent_nodes_catalog for multiprocessing."""
+    parent_catalog = []
+    model_node = model_info.get("unique_id")
+
+    parent_nodes = parent_map.get(model_node, [])
+
+    for parent_node in parent_nodes:
+        if parent_node in catalog_nodes:
+            node_data = catalog_nodes[parent_node]
+            if "metadata" in node_data:
+                parent_catalog.append({
+                    "unique_id": parent_node,
+                    "metadata": node_data["metadata"],
+                    "columns": node_data.get("columns", {})
+                })
+        elif parent_node in manifest_nodes:
+            node_data = manifest_nodes[parent_node]
+            columns = nodes_with_columns.get(parent_node, [])
+            parent_catalog.append({
+                "unique_id": parent_node,
+                "metadata": {
+                    "database": node_data.get("database", ""),
+                    "schema": node_data.get("schema", ""),
+                    "name": node_data.get("name", ""),
+                },
+                "columns": {col: {"name": col} for col in columns}
+            })
+
+    return parent_catalog
+
+
+def _generate_schema_dict_from_catalog_static(parent_catalog):
+    """Static version of _generate_schema_dict_from_catalog for multiprocessing."""
+    schema = {}
+    for node in parent_catalog:
+        db = node["metadata"].get("database", "") or ""
+        schema_name = node["metadata"].get("schema", "") or ""
+        table_name = node["metadata"].get("name", "") or ""
+
+        full_name = f"{db}.{schema_name}.{table_name}".lower()
+        columns = node.get("columns", {})
+        schema[full_name] = {col.lower(): col for col in columns.keys()}
+
+    return schema
+
+
+def _get_list_of_columns_for_node_static(model_node, nodes_with_columns):
+    """Static version of _get_list_of_columns_for_a_dbt_node for multiprocessing."""
+    return nodes_with_columns.get(model_node, [])
+
+
+def _get_dbt_node_from_sqlglot_table_node_static(node, model_node, manifest_nodes, nodes_with_columns):
+    """Static version of get_dbt_node_from_sqlglot_table_node for multiprocessing."""
+    table = node.source
+    col_name = node.name
+
+    if not hasattr(table, 'this') or table.this is None:
+        return None
+
+    table_name = table.this.name.lower() if hasattr(table.this, 'name') else str(table.this).lower()
+    schema_name = table.this.db.lower() if hasattr(table.this, 'db') and table.this.db else None
+    db_name = table.this.catalog.lower() if hasattr(table.this, 'catalog') and table.this.catalog else None
+
+    # Try to find matching node
+    for node_id, node_info in manifest_nodes.items():
+        node_name = node_info.get("name", "").lower()
+        node_schema = (node_info.get("schema") or "").lower()
+        node_db = (node_info.get("database") or "").lower()
+
+        if node_name == table_name:
+            if schema_name is None or node_schema == schema_name:
+                if db_name is None or node_db == db_name:
+                    return {"dbt_node": node_id, "column": col_name}
+
+    return None
+
 
 class DbtColumnLineageExtractor:
     def __init__(self, manifest_path, catalog_path, selected_models=[]):
@@ -572,17 +807,19 @@ class DbtColumnLineageExtractor:
 
         return related_structure
 
-    def extract_project_lineage(self):
+    def extract_project_lineage(self, num_workers=None):
         """
-        Stream lineage extraction to minimize peak memory:
-        - For each model, parse/qualify once.
-        - For each column, compute lineage, immediately materialize parents and update children.
-        - Do not accumulate sqlglot Node graphs across the entire project.
-        """
-        self.logger.info("Streaming lineage extraction (memory-optimized)...")
+        Parallel lineage extraction using multiprocessing.
+        - Distributes model processing across multiple CPU cores.
+        - Merges results at the end.
 
-        parents: dict = {}
-        children: dict = {}
+        Args:
+            num_workers: Number of worker processes. Defaults to CPU count.
+        """
+        if num_workers is None:
+            num_workers = cpu_count()
+
+        self.logger.info(f"Parallel lineage extraction using {num_workers} workers...")
 
         # Prepare model list respecting selection if provided
         all_models = (
@@ -596,152 +833,64 @@ class DbtColumnLineageExtractor:
         )
 
         total_models = len(all_models)
-        processed_count = 0
-        error_count = 0
+        is_tty = sys.stdout.isatty()
 
+        # Prepare data that workers need (must be picklable)
+        manifest_nodes = self.manifest.get("nodes", {})
+        catalog_nodes = self.catalog.get("nodes", {})
+
+        # Build args for each model
+        model_args = []
         for model_node in all_models:
-            model_info = self.manifest["nodes"].get(model_node)
-            if not model_info:
-                continue
+            model_info = manifest_nodes.get(model_node)
+            if model_info:
+                model_args.append((
+                    model_node,
+                    model_info,
+                    self.dialect,
+                    manifest_nodes,
+                    self.nodes_with_columns,
+                    catalog_nodes,
+                    self.parent_map,
+                    None,  # counter - not used with imap
+                    total_models
+                ))
 
-            processed_count += 1
-            self.logger.debug(f"{processed_count}/{total_models} Processing model {model_node}")
+        # Process in parallel using imap for progress updates
+        parents: dict = {}
+        children: dict = {}
+        error_count = 0
+        processed_count = 0
 
-            try:
-                if model_info.get("path", "").endswith(".py"):
-                    self.logger.debug(
-                        f"Skipping column lineage detection for Python model {model_node}"
-                    )
-                    continue
-                if model_info.get("resource_type") not in ["model", "snapshot"]:
-                    continue
-                if not model_info.get("compiled_code"):
-                    self.logger.debug(f"Skipping {model_node} as it has no compiled SQL code")
-                    continue
+        with Pool(processes=num_workers) as pool:
+            for result in pool.imap_unordered(_process_single_model, model_args, chunksize=250):
+                model_node, model_parents, model_children, had_error = result
+                processed_count += 1
 
-                parent_catalog = self._get_parent_nodes_catalog(model_info)
-                schema = self._generate_schema_dict_from_catalog(parent_catalog)
-                model_sql = model_info["compiled_code"]
+                if is_tty:
+                    sys.stdout.write(f"\r[INFO] Processing models: {processed_count} of {total_models}")
+                    sys.stdout.flush()
 
-                # Parse and qualify once per model
-                parsed_model_sql = maybe_parse(model_sql, dialect=self.dialect)
-                if self.dialect == "postgres":
-                    parsed_model_sql = parsing_utils.remove_quotes(parsed_model_sql)
-                if self.dialect == "bigquery":
-                    parsed_model_sql = parsing_utils.remove_upper(parsed_model_sql)
-                qualified_expr, scope = prepare_scope(parsed_model_sql, schema=schema, dialect=self.dialect)
+                if had_error:
+                    error_count += 1
 
-                def normalize_column_name(name: str) -> str:
-                    name = name.strip('"').strip("'")
-                    name = re.sub(r"::\s*\w+$", "", name)
-                    if name.startswith("$"):
-                        name = name[1:]
-                        
-                    return name
-
-                # Initialize parents entry for this model
-                model_parents: dict = {}
-
-                columns = self._get_list_of_columns_for_a_dbt_node(model_node)
-
-                for column_name in columns:
-                    column_key = column_name.lower()
-                    # Snapshot special columns
-                    if model_info.get("resource_type") == "snapshot" and column_name in [
-                        "dbt_valid_from",
-                        "dbt_valid_to",
-                        "dbt_updated_at",
-                        "dbt_scd_id",
-                    ]:
-                        self.logger.debug(f"Skipping special snapshot column {column_name}")
-                        model_parents[column_key] = []
-                        continue
-
-                    model_parents[column_key] = []
-
-                    def append_parent(parent_columns, lineage_type, _model_parents=model_parents, _column_key=column_key):
-                        parent_model = parent_columns["dbt_node"]
-                        parent_col = parent_columns["column"].lower()
-                        if parent_model == model_node:
-                            return
-                        if parent_columns not in _model_parents[_column_key]:
-                            parent_columns["lineage_type"] = lineage_type
-                            _model_parents[_column_key].append(parent_columns)
-                        # Update children incrementally
-                        children.setdefault(parent_model, {}).setdefault(parent_col, []).append(
-                            {"column": _column_key, "dbt_node": model_node}
-                        )
-
-                    try:
-                        normalized_column = normalize_column_name(column_name)
-                        lineage_node = lineage(
-                            normalized_column,
-                            qualified_expr,
-                            schema=schema,
-                            dialect=self.dialect,
-                            scope=scope,
-                        )
-
-                        for n in lineage_node.walk():
-                            if n.source.key == "table":
-                                parent_columns = self.get_dbt_node_from_sqlglot_table_node(n, model_node)
-                                if parent_columns:
-                                    append_parent(parent_columns, lineage_node.lineage_type)
-
-                    except SqlglotError:
-                        # Fallback: try to parse as expression and extract columns
-                        try:
-                            parsed_sql = parsed_model_sql
-                            alias_expr_map = {}
-                            select_exprs = get_select_expressions(parsed_sql)
-                            for expr in select_exprs:
-                                alias = expr.alias_or_name
-                                if alias:
-                                    alias_expr_map[alias.lower()] = expr
-                            expr = alias_expr_map.get(normalize_column_name(column_name).lower())
-                            self.logger.debug(f"Available aliases in query: {list(alias_expr_map.keys())}")
-                            if expr:
-                                upstream_columns = extract_column_refs(expr)
-                                for col in upstream_columns:
-                                    try:
-                                        sub_node = lineage(
-                                            col.name,
-                                            qualified_expr,
-                                            schema=schema,
-                                            dialect=self.dialect,
-                                            scope=scope,
-                                        )
-                                        for n in sub_node.walk():
-                                            if n.source.key == "table":
-                                                parent_columns = self.get_dbt_node_from_sqlglot_table_node(n, model_node)
-                                                if parent_columns:
-                                                    append_parent(parent_columns, sub_node.lineage_type)
-                                    except SqlglotError as e_inner:
-                                        self.logger.error(
-                                            f"Could not resolve lineage for '{col.name}' in alias '{column_name}': {e_inner}"
-                                        )
-                            else:
-                                self.logger.debug(f"No expression found for alias '{model_node}' '{column_name}'")
-                        except Exception as e2:
-                            self.logger.error(f"Fallback error on {column_name}: {e2}")
-                    except Exception as e:
-                        self.logger.error(
-                            f"Unexpected error processing model {model_node}, column {column_name}: {e}"
-                        )
-
+                # Merge parents
                 if model_parents:
                     parents[model_node] = model_parents
 
-                # Aggressively release large per-model structures
-                del qualified_expr, scope, parsed_model_sql, model_parents
-                if processed_count % 50 == 0:
-                    gc.collect()
+                # Merge children
+                for parent_model, cols in model_children.items():
+                    if parent_model not in children:
+                        children[parent_model] = {}
+                    for col, child_list in cols.items():
+                        if col not in children[parent_model]:
+                            children[parent_model][col] = []
+                        children[parent_model][col].extend(child_list)
 
-            except Exception as e:
-                error_count += 1
-                self.logger.error(f"Error processing model {model_node}: {str(e)}")
-                self.logger.debug("Continuing with next model...")
-                continue
+        # Print newline to finish progress line (only if TTY)
+        if is_tty:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         if error_count > 0:
             self.logger.info(
