@@ -35,7 +35,7 @@ def _process_single_model(args):
         tuple: (model_node, model_parents, model_children, error_occurred)
     """
     (model_node, model_info, dialect, manifest_nodes, nodes_with_columns,
-     catalog_nodes, parent_map, counter, total_models) = args
+     catalog_nodes, catalog_sources, parent_map, counter, total_models) = args
 
     logger = logging.getLogger("colibri")
     model_parents = {}
@@ -52,7 +52,7 @@ def _process_single_model(args):
 
         # Build parent catalog for this model
         parent_catalog = _get_parent_nodes_catalog_static(
-            model_info, manifest_nodes, catalog_nodes, parent_map, nodes_with_columns
+            model_info, manifest_nodes, catalog_nodes, catalog_sources, parent_map, nodes_with_columns
         )
         schema = _generate_schema_dict_from_catalog_static(parent_catalog)
         model_sql = model_info["compiled_code"]
@@ -73,7 +73,7 @@ def _process_single_model(args):
             return name
 
         # Get columns for this model
-        columns = _get_list_of_columns_for_node_static(model_node, catalog_nodes)
+        columns = _get_list_of_columns_for_node_static(model_node, catalog_nodes, catalog_sources)
 
         for column_name in columns:
             column_key = column_name.lower()
@@ -99,7 +99,7 @@ def _process_single_model(args):
                 for n in lineage_node.walk():
                     if n.source.key == "table":
                         parent_columns = _get_dbt_node_from_sqlglot_table_node_static(
-                            n, model_node, manifest_nodes, nodes_with_columns
+                            n, model_node, manifest_nodes, nodes_with_columns, dialect
                         )
                         if parent_columns:
                             parent_model = parent_columns["dbt_node"]
@@ -142,7 +142,7 @@ def _process_single_model(args):
                                 for n in sub_node.walk():
                                     if n.source.key == "table":
                                         parent_columns = _get_dbt_node_from_sqlglot_table_node_static(
-                                            n, model_node, manifest_nodes, nodes_with_columns
+                                            n, model_node, manifest_nodes, nodes_with_columns, dialect
                                         )
                                         if parent_columns:
                                             parent_model = parent_columns["dbt_node"]
@@ -181,12 +181,17 @@ def _process_single_model(args):
         return (model_node, {}, {}, True)
 
 
-def _get_parent_nodes_catalog_static(model_info, manifest_nodes, catalog_nodes, parent_map, nodes_with_columns):
-    """Static version of _get_parent_nodes_catalog for multiprocessing."""
+def _get_parent_nodes_catalog_static(model_info, manifest_nodes, catalog_nodes, catalog_sources, parent_map, nodes_with_columns):
+    """Static version of _get_parent_nodes_catalog for multiprocessing.
+
+    Matches single-threaded behavior: only includes parents that are in the catalog.
+    Parents not in catalog (ephemeral, not materialized) are skipped.
+    """
     parent_catalog = []
     model_node = model_info.get("unique_id")
 
-    parent_nodes = parent_map.get(model_node, [])
+    # Use depends_on.nodes like single-threaded version (same as parent_map but more direct)
+    parent_nodes = model_info.get("depends_on", {}).get("nodes", [])
 
     for parent_node in parent_nodes:
         if parent_node in catalog_nodes:
@@ -197,69 +202,95 @@ def _get_parent_nodes_catalog_static(model_info, manifest_nodes, catalog_nodes, 
                     "metadata": node_data["metadata"],
                     "columns": node_data.get("columns", {})
                 })
-        elif parent_node in manifest_nodes:
-            node_data = manifest_nodes[parent_node]
-            columns = nodes_with_columns.get(parent_node, [])
-            parent_catalog.append({
-                "unique_id": parent_node,
-                "metadata": {
-                    "database": node_data.get("database", ""),
-                    "schema": node_data.get("schema", ""),
-                    "name": node_data.get("name", ""),
-                },
-                "columns": {col: {"name": col} for col in columns}
-            })
+        elif parent_node in catalog_sources:
+            node_data = catalog_sources[parent_node]
+            if "metadata" in node_data:
+                parent_catalog.append({
+                    "unique_id": parent_node,
+                    "metadata": node_data["metadata"],
+                    "columns": node_data.get("columns", {})
+                })
+        # Skip parents not in catalog (matches single-threaded behavior)
 
     return parent_catalog
 
 
 def _generate_schema_dict_from_catalog_static(parent_catalog):
-    """Static version of _generate_schema_dict_from_catalog for multiprocessing."""
-    schema = {}
+    """Static version of _generate_schema_dict_from_catalog for multiprocessing.
+
+    Returns a nested dict structure: {db: {schema: {table: {col: type}}}}
+    This format is required by sqlglot's qualify to properly expand SELECT *.
+    """
+    schema_dict = {}
     for node in parent_catalog:
-        db = node["metadata"].get("database", "") or ""
+        db_name = node["metadata"].get("database", "") or ""
         schema_name = node["metadata"].get("schema", "") or ""
         table_name = node["metadata"].get("name", "") or ""
 
-        full_name = f"{db}.{schema_name}.{table_name}".lower()
+        if db_name not in schema_dict:
+            schema_dict[db_name] = {}
+        if schema_name not in schema_dict[db_name]:
+            schema_dict[db_name][schema_name] = {}
+        if table_name not in schema_dict[db_name][schema_name]:
+            schema_dict[db_name][schema_name][table_name] = {}
+
         columns = node.get("columns", {})
-        schema[full_name] = {col.lower(): col for col in columns.keys()}
+        # Match the format from DBTNodeCatalog.get_column_types()
+        for col_name, col_info in columns.items():
+            col_type = col_info.get("type") if isinstance(col_info, dict) else col_info
+            schema_dict[db_name][schema_name][table_name][col_name] = col_type
 
-    return schema
+    return schema_dict
 
 
-def _get_list_of_columns_for_node_static(model_node, catalog_nodes):
+def _get_list_of_columns_for_node_static(model_node, catalog_nodes, catalog_sources):
     """Static version of _get_list_of_columns_for_a_dbt_node for multiprocessing."""
     if model_node in catalog_nodes:
         columns = catalog_nodes[model_node].get("columns", {})
         return [col.lower() for col in columns.keys()]
+    elif model_node in catalog_sources:
+        columns = catalog_sources[model_node].get("columns", {})
+        return [col.lower() for col in columns.keys()]
     return []
 
 
-def _get_dbt_node_from_sqlglot_table_node_static(node, model_node, manifest_nodes, nodes_with_columns):
+def _get_dbt_node_from_sqlglot_table_node_static(node, model_node, manifest_nodes, nodes_with_columns, dialect):
     """Static version of get_dbt_node_from_sqlglot_table_node for multiprocessing."""
-    table = node.source
-    col_name = node.name
-
-    if not hasattr(table, 'this') or table.this is None:
+    if node.source.key != "table":
         return None
 
-    table_name = table.this.name.lower() if hasattr(table.this, 'name') else str(table.this).lower()
-    schema_name = table.this.db.lower() if hasattr(table.this, 'db') and table.this.db else None
-    db_name = table.this.catalog.lower() if hasattr(table.this, 'catalog') and table.this.catalog else None
+    if not node.source.catalog and not node.source.db:
+        return None
 
-    # Try to find matching node
-    for node_id, node_info in manifest_nodes.items():
-        node_name = node_info.get("name", "").lower()
-        node_schema = (node_info.get("schema") or "").lower()
-        node_db = (node_info.get("database") or "").lower()
+    column_name = node.name.split(".")[-1].lower()
 
-        if node_name == table_name:
-            if schema_name is None or node_schema == schema_name:
-                if db_name is None or node_db == db_name:
-                    return {"dbt_node": node_id, "column": col_name}
+    if dialect == 'clickhouse':
+        table_name = f"{node.source.db}.{node.source.name}"
+    else:
+        table_name = f"{node.source.catalog}.{node.source.db}.{node.source.name}"
 
-    return None
+    # Look up in nodes_with_columns (keyed by relation_name)
+    for key, data in nodes_with_columns.items():
+        if key.lower() == table_name.lower():
+            return {"column": column_name, "dbt_node": data["unique_id"]}
+
+    # Fallback: check if table is hardcoded in raw code
+    model_info = manifest_nodes.get(model_node, {})
+    raw_code = model_info.get("raw_code", "").lower()
+
+    table_variations = [
+        table_name,
+        table_name.lstrip("."),
+        f"{node.source.db}.{node.source.name}".lower(),
+        node.source.name.lower(),
+    ]
+    table_variations = list(dict.fromkeys(table_variations))
+
+    for variation in table_variations:
+        if variation and variation in raw_code:
+            return {"column": column_name, "dbt_node": f"_HARDCODED_REF___{table_name.lower()}"}
+
+    return {"column": column_name, "dbt_node": f"_NOT_FOUND___{table_name.lower()}"}
 
 
 class DbtColumnLineageExtractor:
@@ -841,6 +872,7 @@ class DbtColumnLineageExtractor:
         # Prepare data that workers need (must be picklable)
         manifest_nodes = self.manifest.get("nodes", {})
         catalog_nodes = self.catalog.get("nodes", {})
+        catalog_sources = self.catalog.get("sources", {})
 
         # Build args for each model
         model_args = []
@@ -854,6 +886,7 @@ class DbtColumnLineageExtractor:
                     manifest_nodes,
                     self.nodes_with_columns,
                     catalog_nodes,
+                    catalog_sources,
                     self.parent_map,
                     None,  # counter - not used with imap
                     total_models

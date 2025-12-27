@@ -1071,6 +1071,7 @@ def test_process_single_model_static_function():
         manifest_nodes,
         nodes_with_columns,
         catalog_nodes,
+        {},  # catalog_sources
         parent_map,
         None,  # counter
         1  # total_models
@@ -1110,9 +1111,10 @@ def test_process_single_model_skips_python_models():
         model_info,
         "snowflake",
         {model_node: model_info},
-        {},
-        {},
-        {},
+        {},  # nodes_with_columns
+        {},  # catalog_nodes
+        {},  # catalog_sources
+        {},  # parent_map
         None,
         1
     )
@@ -1146,9 +1148,10 @@ def test_process_single_model_skips_no_compiled_code():
         model_info,
         "snowflake",
         {model_node: model_info},
-        {},
-        {},
-        {},
+        {},  # nodes_with_columns
+        {},  # catalog_nodes
+        {},  # catalog_sources
+        {},  # parent_map
         None,
         1
     )
