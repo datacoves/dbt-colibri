@@ -1056,9 +1056,13 @@ def test_process_single_model_static_function():
         "name": "simple_model"
     }
     manifest_nodes = {model_node: model_info}
-    catalog_nodes = {}
+    catalog_nodes = {
+        model_node: {
+            "columns": {"id": {"type": "INTEGER"}, "name": {"type": "VARCHAR"}}
+        }
+    }
     parent_map = {model_node: []}
-    nodes_with_columns = {model_node: ["id", "name"]}
+    nodes_with_columns = {}  # Not used anymore, catalog_nodes has the columns
 
     args = (
         model_node,
@@ -1081,6 +1085,9 @@ def test_process_single_model_static_function():
     assert isinstance(model_parents, dict)
     assert isinstance(model_children, dict)
     assert isinstance(had_error, bool)
+    # Verify columns were processed
+    assert "id" in model_parents
+    assert "name" in model_parents
 
 
 def test_process_single_model_skips_python_models():

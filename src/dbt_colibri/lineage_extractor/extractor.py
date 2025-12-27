@@ -73,7 +73,7 @@ def _process_single_model(args):
             return name
 
         # Get columns for this model
-        columns = _get_list_of_columns_for_node_static(model_node, nodes_with_columns)
+        columns = _get_list_of_columns_for_node_static(model_node, catalog_nodes)
 
         for column_name in columns:
             column_key = column_name.lower()
@@ -228,9 +228,12 @@ def _generate_schema_dict_from_catalog_static(parent_catalog):
     return schema
 
 
-def _get_list_of_columns_for_node_static(model_node, nodes_with_columns):
+def _get_list_of_columns_for_node_static(model_node, catalog_nodes):
     """Static version of _get_list_of_columns_for_a_dbt_node for multiprocessing."""
-    return nodes_with_columns.get(model_node, [])
+    if model_node in catalog_nodes:
+        columns = catalog_nodes[model_node].get("columns", {})
+        return [col.lower() for col in columns.keys()]
+    return []
 
 
 def _get_dbt_node_from_sqlglot_table_node_static(node, model_node, manifest_nodes, nodes_with_columns):
