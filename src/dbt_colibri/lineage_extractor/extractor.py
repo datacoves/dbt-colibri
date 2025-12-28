@@ -902,9 +902,10 @@ class DbtColumnLineageExtractor:
                 model_node, model_parents, model_children, had_error = result
                 processed_count += 1
 
-                # Write to stdout for terminal display, flush immediately for streaming
-                sys.stdout.write(f"\r[PROGRESS] Processing models: {processed_count} of {total_models}")
-                sys.stdout.flush()
+                # Only output progress every 200 models or at completion to reduce I/O overhead
+                if processed_count % 200 == 0 or processed_count == total_models:
+                    sys.stdout.write(f"\r[PROGRESS] Processing models: {processed_count} of {total_models}")
+                    sys.stdout.flush()
 
                 if had_error:
                     error_count += 1
