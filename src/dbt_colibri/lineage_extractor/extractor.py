@@ -170,9 +170,9 @@ def _process_single_model(args):
         if counter is not None:
             with counter.get_lock():
                 counter.value += 1
-                if sys.stdout.isatty():
-                    sys.stdout.write(f"\r[INFO] Processing models: {counter.value} of {total_models}")
-                    sys.stdout.flush()
+                # Write to stdout for terminal display, flush immediately for streaming
+                sys.stdout.write(f"\r[PROGRESS] Processing models: {counter.value} of {total_models}")
+                sys.stdout.flush()
 
         return (model_node, model_parents, model_children, False)
 
@@ -867,7 +867,6 @@ class DbtColumnLineageExtractor:
         )
 
         total_models = len(all_models)
-        is_tty = sys.stdout.isatty()
 
         # Prepare data that workers need (must be picklable)
         manifest_nodes = self.manifest.get("nodes", {})
@@ -903,9 +902,9 @@ class DbtColumnLineageExtractor:
                 model_node, model_parents, model_children, had_error = result
                 processed_count += 1
 
-                if is_tty:
-                    sys.stdout.write(f"\r[INFO] Processing models: {processed_count} of {total_models}")
-                    sys.stdout.flush()
+                # Write to stdout for terminal display, flush immediately for streaming
+                sys.stdout.write(f"\r[PROGRESS] Processing models: {processed_count} of {total_models}")
+                sys.stdout.flush()
 
                 if had_error:
                     error_count += 1
@@ -923,10 +922,9 @@ class DbtColumnLineageExtractor:
                             children[parent_model][col] = []
                         children[parent_model][col].extend(child_list)
 
-        # Print newline to finish progress line (only if TTY)
-        if is_tty:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        # Print newline after progress completes
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
         if error_count > 0:
             self.logger.info(
