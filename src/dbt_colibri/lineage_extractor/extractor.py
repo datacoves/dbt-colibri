@@ -372,6 +372,11 @@ class DbtColumnLineageExtractor:
             processed_count += 1
             self.logger.debug(f"{processed_count}/{total_models} Processing model {model_node}")
 
+            # Output progress every 200 models for cross-machine progress tracking
+            # Use newline (not carriage return) for reliable parsing when piped to Elixir subprocess
+            if processed_count % 200 == 0 or processed_count == total_models:
+                print(f"[PROGRESS] Processing models: {processed_count} of {total_models}", flush=True)
+
             try:
                 if model_info["path"].endswith(".py"):
                     self.logger.debug(
@@ -650,6 +655,11 @@ class DbtColumnLineageExtractor:
 
             processed_count += 1
             self.logger.debug(f"{processed_count}/{total_models} Processing model {model_node}")
+
+            # Output progress every 200 models for cross-machine progress tracking
+            # Use newline (not carriage return) for reliable parsing when piped to Elixir subprocess
+            if processed_count % 200 == 0 or processed_count == total_models:
+                print(f"[PROGRESS] Processing models: {processed_count} of {total_models}", flush=True)
 
             try:
                 if model_info.get("path", "").endswith(".py"):
